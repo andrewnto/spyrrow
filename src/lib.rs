@@ -1,7 +1,10 @@
-use jagua_rs::io::ext_repr::{ExtItem as BaseItem, ExtSPolygon, ExtShape};
+use jagua_rs::io::ext_repr::{
+    ExtItem as BaseItem, ExtLayout, ExtPlacedItem, ExtSPolygon, ExtShape, ExtTransformation,
+};
 use jagua_rs::io::import::Importer;
 use jagua_rs::probs::spp::entities::{SPInstance, SPSolution};
-use jagua_rs::probs::spp::io::ext_repr::{ExtItem, ExtSPInstance};
+use jagua_rs::probs::spp::io::ext_repr::{ExtItem, ExtSPInstance, ExtSPSolution};
+use jagua_rs::probs::spp::io::import_solution;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::SeedableRng;
@@ -12,7 +15,7 @@ use sparrow::config::{DEFAULT_SPARROW_CONFIG, ShrinkDecayStrategy};
 use sparrow::consts::{DEFAULT_FAIL_DECAY_RATIO_CMPR, DEFAULT_MAX_CONSEQ_FAILS_EXPL};
 use sparrow::optimizer::optimize;
 use sparrow::util::listener::{DummySolListener, ReportType, SolutionListener};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -289,6 +292,61 @@ fn all_unique(strings: &[&str]) -> bool {
     strings.iter().all(|s| seen.insert(*s))
 }
 
+/// Build a jagua-rs `SPSolution` from a Python-provided solution, for warm starting.
+///
+/// Mirrors how `From<StripPackingInstancePy> for ExtSPInstance` + `import_instance`
+/// reconstruct the instance, but for the solution side via `import_solution`.
+///
+/// `item_ids` is the instance's items in declaration order; a PlacedItem's string
+/// `id` is inverted to the item index (the same indexing the export side uses:
+/// `self.items[jpi.item_id as usize]`). Round-trips a solution returned by a prior
+/// `solve()` exactly, since `ExtTransformation::from` does `.to_degrees()` and
+/// `import_solution`'s `DTransformation::from` does `.to_radians()`.
+fn build_initial_solution(
+    instance: &SPInstance,
+    sol: &StripPackingSolutionPy,
+    item_ids: &[String],
+) -> PyResult<SPSolution> {
+    let id_to_idx: HashMap<&str, u64> = item_ids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i as u64))
+        .collect();
+
+    let placed_items = sol
+        .placed_items
+        .iter()
+        .map(|p| {
+            let item_id = *id_to_idx.get(p.id.as_str()).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "initial_solution references unknown item id '{}'",
+                    p.id
+                ))
+            })?;
+            Ok(ExtPlacedItem {
+                item_id,
+                transformation: ExtTransformation {
+                    rotation: p.rotation,       // already in degrees
+                    translation: p.translation, // (f32, f32)
+                },
+            })
+        })
+        .collect::<PyResult<Vec<ExtPlacedItem>>>()?;
+
+    let ext_solution = ExtSPSolution {
+        strip_width: sol.width,
+        layout: ExtLayout {
+            container_id: 0, // single strip => one container
+            placed_items,
+            density: sol.density,
+        },
+        density: sol.density,
+        run_time_sec: 0, // unread by import_solution
+    };
+
+    Ok(import_solution(instance, &ext_solution))
+}
+
 #[pyclass(name = "StripPackingConfig", get_all, set_all)]
 #[derive(Clone, Serialize)]
 /// Initializes a configuration object for the strip packing algorithm.
@@ -469,18 +527,29 @@ impl StripPackingInstancePy {
     ///     progress (ProgressQueue, optional): If provided, progress reports are pushed to this
     ///       queue during optimization. Use `queue.drain()` from another thread to monitor progress.
     ///       Defaults to None.
+    ///     groups (Sequence[Sequence[int]], optional): item-index groups for coupled handling.
+    ///     initial_solution (StripPackingSolution, optional): if provided, warm-starts the
+    ///       optimizer from this layout instead of a cold bottom-left-fill construction.
+    ///       Must reference items of THIS instance (by id). Defaults to None.
     ///
     /// Returns:
     ///     a StripPackingSolution
     ///
-    #[pyo3(signature = (config, progress=None, groups=None))]
-    fn solve(&self, config: StripPackingConfigPy, progress: Option<ProgressQueuePy>, groups: Option<Vec<Vec<usize>>>, py: Python) -> StripPackingSolutionPy {
+    #[pyo3(signature = (config, progress=None, groups=None, initial_solution=None))]
+    fn solve(
+        &self,
+        config: StripPackingConfigPy,
+        progress: Option<ProgressQueuePy>,
+        groups: Option<Vec<Vec<usize>>>,
+        initial_solution: Option<StripPackingSolutionPy>,
+        py: Python,
+    ) -> PyResult<StripPackingSolutionPy> {
         if self.items.is_empty() {
-            return StripPackingSolutionPy {
+            return Ok(StripPackingSolutionPy {
                 width: 0.0,
                 density: 0.0,
-                placed_items:Vec::new(),
-            }
+                placed_items: Vec::new(),
+            });
         }
         let mut rs_config = DEFAULT_SPARROW_CONFIG;
         rs_config.rng_seed = Some(config.seed as usize);
@@ -507,15 +576,26 @@ impl StripPackingInstancePy {
             .expect("Expected a Strip Packing Problem Instance");
         let mut terminator = terminator::PythonTerminator::default();
 
+        // Item ids in declaration order; reused for both warm-start inversion and the listener.
+        let item_ids: Vec<String> = self.items.iter().map(|i| i.id.clone()).collect();
+
+        // Build the warm-start solution (if any) BEFORE py.detach: conversion can fail
+        // (unknown item id) and must surface as a Python error, not be swallowed in the
+        // GIL-released closure.
+        let init_sol: Option<SPSolution> = match initial_solution {
+            Some(ref s) => Some(build_initial_solution(&instance, s, &item_ids)?),
+            None => None,
+        };
+
         let mut listener = match progress {
             Some(pq) => SolListener::Progress(ProgressListener {
                 queue: pq.inner,
-                item_ids: self.items.iter().map(|i| i.id.clone()).collect(),
+                item_ids: item_ids.clone(),
             }),
             None => SolListener::Dummy(DummySolListener {}),
         };
 
-        py.detach(move || {
+        let result = py.detach(move || {
             let solution = optimize(
                 instance.clone(),
                 rng,
@@ -523,7 +603,7 @@ impl StripPackingInstancePy {
                 &mut terminator,
                 &rs_config.expl_cfg,
                 &rs_config.cmpr_cfg,
-                None,
+                init_sol.as_ref(),
                 groups.clone().unwrap_or_default(),
             );
 
@@ -545,7 +625,9 @@ impl StripPackingInstancePy {
                 density: solution.density,
                 placed_items,
             }
-        })
+        });
+
+        Ok(result)
     }
 }
 
