@@ -473,8 +473,8 @@ impl StripPackingInstancePy {
     /// Returns:
     ///     a StripPackingSolution
     ///
-    #[pyo3(signature = (config, progress=None))]
-    fn solve(&self, config: StripPackingConfigPy, progress: Option<ProgressQueuePy>, py: Python) -> StripPackingSolutionPy {
+    #[pyo3(signature = (config, progress=None, groups=None))]
+    fn solve(&self, config: StripPackingConfigPy, progress: Option<ProgressQueuePy>, groups: Option<Vec<Vec<usize>>>, py: Python) -> StripPackingSolutionPy {
         if self.items.is_empty() {
             return StripPackingSolutionPy {
                 width: 0.0,
@@ -524,6 +524,7 @@ impl StripPackingInstancePy {
                 &rs_config.expl_cfg,
                 &rs_config.cmpr_cfg,
                 None,
+                groups.clone().unwrap_or_default(),
             );
 
             let solution = jagua_rs::probs::spp::io::export(&instance, &solution, *EPOCH);

@@ -182,7 +182,7 @@ class StripPackingInstance:
     def to_json_str(self) -> str:
         """Return a string of the JSON representation of the object"""
 
-    def solve(self, config: StripPackingConfig, progress: Optional[ProgressQueue] = None) -> StripPackingSolution:
+    def solve(self, config: StripPackingConfig, progress: Optional[ProgressQueue] = None, groups: Optional[Sequence[Sequence[int]]] = None) -> StripPackingSolution:
         """
         The method to solve the instance.
 
